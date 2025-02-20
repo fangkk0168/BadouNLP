@@ -14,10 +14,10 @@ from transformers import BertModel
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, input_dim, vocab):
+    def __init__(self, input_dim, vocab_size):
         super(LanguageModel, self).__init__()
         self.bert = BertModel.from_pretrained(r"D:\code_repository\ai-study\bert-base-chinese", return_dict=False)
-        self.classify = nn.Linear(input_dim, len(vocab))
+        self.classify = nn.Linear(input_dim, vocab_size)
         self.dropout = nn.Dropout(0.1)
         self.loss = nn.functional.cross_entropy
 
@@ -34,7 +34,7 @@ class LanguageModel(nn.Module):
         y_pred = self.classify(sequence_output)  # output shape:(batch_size, seq_length, vocab_size)
         if y is not None:
             """
-            y_pred：64 * 10 * 3961。可以理解为64个12*3961的矩阵
+            y_pred：64 * 10 * 3961。可以理解为64个10*3961的矩阵
                 y_pred.shape[-1]：3961
                 y_pred.view(-1, 3961)：640 * 3961。把64个10*3961矩阵都放在一起，可以想象成摞起来放在一起，也就是 640 * 3961的形状。
             y：64 * 10。可以理解为64*10的矩阵，也就是64个长度为10的向量，如下所示：
@@ -50,16 +50,6 @@ class LanguageModel(nn.Module):
             return torch.softmax(y_pred, dim=-1)
 
 
-# 加载字表
-def build_vocab(vocab_path):
-    vocab = {"<pad>": 0}
-    with open(vocab_path, encoding="utf8") as f:
-        for index, line in enumerate(f):
-            char = line[:-1]  # 去掉结尾换行符
-            vocab[char] = index + 1  # 留出0位给pad token
-    return vocab
-
-
 # 加载语料
 def load_corpus(path):
     corpus = ""
@@ -71,46 +61,46 @@ def load_corpus(path):
 
 # 随机生成一个样本
 # 从文本中截取随机窗口，前n个字作为输入，最后一个字作为输出
-def build_sample(vocab, window_size, corpus):
+def build_sample(tokenizer, window_size, corpus):
     start = random.randint(0, len(corpus) - 1 - window_size)
     end = start + window_size
     window = corpus[start:end]
     target = corpus[start + 1:end + 1]  # 输入输出错开一位
-    x = [vocab.get(word, vocab['<UNK>']) for word in window]
-    y = [vocab.get(word, vocab['<UNK>']) for word in target]
+    x = tokenizer.encode(window, add_special_tokens=False, padding='max_length', truncation=True, max_length=10)
+    y = tokenizer.encode(target, add_special_tokens=False, padding='max_length', truncation=True, max_length=10)
     return x, y
 
 
 # 建立数据集
+# tokenizer bert的分词器
 # sample_length 输入需要的样本数量。需要多少生成多少
 # window_size 样本长度
 # corpus 语料字符串
-def build_dataset(sample_length, vocab, window_size, corpus):
+def build_dataset(tokenizer, sample_length, window_size, corpus):
     dataset_x = []
     dataset_y = []
     for i in range(sample_length):
-        x, y = build_sample(vocab, window_size, corpus)
+        x, y = build_sample(tokenizer, window_size, corpus)
         dataset_x.append(x)
         dataset_y.append(y)
     return torch.LongTensor(dataset_x), torch.LongTensor(dataset_y)
 
 
 # 建立模型
-def build_model(vocab, char_dim):
-    model = LanguageModel(char_dim, vocab)
+def build_model(vocab_size, char_dim):
+    model = LanguageModel(char_dim, vocab_size)
     return model
 
 
 # 文本生成测试代码
-def generate_sentence(openings, model, vocab, window_size):
-    reverse_vocab = dict((y, x) for x, y in vocab.items())
+def generate_sentence(openings, model, tokenizer):
     model.eval()
     with torch.no_grad():
         pred_char = ""
         # 生成了换行符，或生成文本超过30字则终止迭代
         while pred_char != "\n" and len(openings) <= 30:
             openings += pred_char
-            x = [vocab.get(char, vocab["<UNK>"]) for char in openings[-window_size:]]
+            x = tokenizer.encode(openings, add_special_tokens=False)
             x = torch.LongTensor([x])
             if torch.cuda.is_available():
                 x = x.cuda()
@@ -123,7 +113,7 @@ def generate_sentence(openings, model, vocab, window_size):
             # 采样策略，获取到词表上某个字的索引值
             index = sampling_strategy(y)
             # 根据索引值获取具体的字，不断重复循环，直到句子换行后不再预测
-            pred_char = reverse_vocab[index]
+            pred_char = ''.join(tokenizer.decode(index))
     return openings
 
 
@@ -158,10 +148,10 @@ def train(corpus_path, save_weight=True):
     train_sample = 50000  # 每轮训练总共训练的样本总数
     char_dim = 768  # 每个字的维度
     window_size = 10  # 样本文本长度
-    vocab = build_vocab("vocab.txt")  # 建立字表
+    vocab_size = 21128  # 字表大小，如果使用bert分词时，需要使用该大小
     corpus = load_corpus(corpus_path)  # 加载语料
     tokenizer = BertTokenizer.from_pretrained(r"D:\code_repository\ai-study\bert-base-chinese")
-    model = build_model(vocab, char_dim)  # 建立模型
+    model = build_model(vocab_size, char_dim)  # 建立模型
     if torch.cuda.is_available():
         model = model.cuda()
     optim = torch.optim.Adam(model.parameters(), lr=0.01)  # 建立优化器
@@ -170,11 +160,17 @@ def train(corpus_path, save_weight=True):
         model.train()
         watch_loss = []
         for batch in range(int(train_sample / batch_size)):
-            x, y = build_dataset(batch_size, vocab, window_size, corpus)  # 构建一组训练样本
+            x, y = build_dataset(tokenizer, batch_size, window_size, corpus)  # 构建一组训练样本
             if torch.cuda.is_available():
                 x, y = x.cuda(), y.cuda()
             optim.zero_grad()  # 梯度归零
             batch_size, seq_length = x.size()
+            """
+            这里的mask形状为啥是64*10*10呢？
+                1、因为，输入x(长度为10)经过bert后，会变成一个L*L的self-attention注意力矩阵，也就是10*10的矩阵
+                2、其中64是批次。生成L*L的mask矩阵用于遮盖，就是为了防止前后文交互
+                3、搞清一点，模型预测是一个字一个字进行预测的
+            """
             mask = torch.tril(torch.ones((seq_length, seq_length), dtype=torch.bool))
             mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
             loss = model(x, y, mask)  # 计算loss
@@ -182,8 +178,8 @@ def train(corpus_path, save_weight=True):
             optim.step()  # 更新权重
             watch_loss.append(loss.item())
         print("=========\n第%d轮平均loss:%f" % (epoch + 1, np.mean(watch_loss)))
-        print(generate_sentence("让他在半年之前，就不能做出", model, vocab, window_size))
-        print(generate_sentence("李慕站在山路上，深深的呼吸", model, vocab, window_size))
+        print(generate_sentence("让他在半年之前，就不能做出", model, tokenizer))
+        print(generate_sentence("李慕站在山路上，深深的呼吸", model, tokenizer))
     if not save_weight:
         return
     else:
