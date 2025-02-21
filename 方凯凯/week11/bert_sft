@@ -1,0 +1,256 @@
+# coding:utf8
+import json
+
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+import os
+from transformers import BertTokenizer
+from transformers import BertModel
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+
+"""
+作业：基于pytorch的Bert语言模型 + SFT 训练新闻数据
+"""
+
+
+class LanguageModel(nn.Module):
+    def __init__(self, input_dim, vocab_size):
+        super(LanguageModel, self).__init__()
+        self.bert = BertModel.from_pretrained(r"D:\code_repository\ai-study\bert-base-chinese", return_dict=False)
+        self.classify = nn.Linear(input_dim, vocab_size)
+        self.loss = nn.CrossEntropyLoss(ignore_index=-1)
+
+    # 当输入真实标签，返回loss值；无真实标签，返回预测值
+    def forward(self, x, y=None, mask=None):
+        # print('输入x的形状：', x.shape)
+        if mask is None:
+            sequence_output, pool_output = self.bert(x)
+        else:
+            if torch.cuda.is_available():
+                x = x.cuda()
+                mask = mask.cuda()
+            sequence_output, pool_output = self.bert(input_ids=x, attention_mask=mask)
+        y_pred = self.classify(sequence_output)  # output shape:(batch_size, seq_length, vocab_size)
+        if y is not None:
+            """
+            y_pred：64 * 10 * 3961。可以理解为64个10*3961的矩阵
+                y_pred.shape[-1]：3961
+                y_pred.view(-1, 3961)：640 * 3961。把64个10*3961矩阵都放在一起，可以想象成摞起来放在一起，也就是 640 * 3961的形状。
+            y：64 * 10。可以理解为64*10的矩阵，也就是64个长度为10的向量，如下所示：
+                [[ 1,2,3,4,5,6,7,8,9,10],
+                 [ 1,2,3,4,5,6,7,8,9,10],
+                 ...中间总共64个
+                                        ]]
+                y.view(-1)：640。view(-1)表示将Tensor转为一维Tensor。
+                [ 1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10...] 总共640个元素
+            """
+            return self.loss(y_pred.view(-1, y_pred.shape[-1]), y.view(-1))
+        else:
+            return torch.softmax(y_pred, dim=-1)
+
+
+# 加载语料
+def load_corpus(path):
+    news_dict = {}
+    corpus = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = json.loads(line)
+            if isinstance(line, dict):
+                news_dict['title'] = line["title"]
+                news_dict['content'] = line["content"]
+                corpus.append(news_dict)
+    return corpus
+
+
+# 建立数据集
+# tokenizer bert的分词器
+# max_length 最大字符长度
+# corpus 语料字符串
+def build_dataset(tokenizer, max_length, corpus, batch_size):
+    dataset = []
+    for news_val in corpus:
+        title = news_val["title"]
+        content = news_val["content"]
+        title_encode = tokenizer.encode(title, add_special_tokens=False)
+        content_encode = tokenizer.encode(content, add_special_tokens=False)
+        # CLS + Title + SEP + Context + SEP
+        x = [tokenizer.cls_token_id] + title_encode + [tokenizer.sep_token_id] + content_encode + [
+            tokenizer.sep_token_id]
+        # Title + [-1] + Content + SEP + -1。这里设置-1，是在交叉熵计算时，指定label=-1不计算
+        # 这里组装的x和y就是 图1.png
+        y = len(title_encode) * [-1] + [-1] + content_encode + [tokenizer.sep_token_id] + [-1]
+        # 构建一个的mask矩阵，让title内可以交互，content中上下文之间没有交互
+        # mask构建后，就是 图片2.png
+        mask = create_mask(len(title_encode), len(content_encode))
+        # padding，就是mask矩阵规定到max_length * max_length大小。输入x和输出y都是在max_length长度
+        # 这里padding和mask的过程如 全过程图.jpg
+        x = x[:max_length] + [0] * (max_length - len(x))
+        y = y[:max_length] + [0] * (max_length - len(y))
+        x = torch.LongTensor(x)
+        y = torch.LongTensor(y)
+        mask = pad_mask(mask, (max_length, max_length))
+        dataset.append([x, mask, y])
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    # 另外一种思考。但是，这种方式不行，是先用max_length进行截取。原因：title和content是放在一个里面了，如果先截取，后面循环时就分不清S1和S2
+    # 见 另一种思考.jpg
+    # dataset = []
+    # for news_dict in corpus:
+    #     title = news_dict['title']
+    #     content = news_dict['content']
+    #     title_encode = tokenizer.encode(title, add_special_tokens=False)
+    #     content_encode = tokenizer.encode(content, add_special_tokens=False)
+    #     x = [tokenizer.cls_token_id] + title_encode + [tokenizer.sep_token_id] + content_encode + [
+    #         tokenizer.sep_token_id]
+    #     y = len(title_encode) * [-1] + [-1] + content_encode + [tokenizer.sep_token_id] + [-1]
+    #     # 对输入x和标签y进行补齐或截断
+    #     x = x[:max_length] + [0] * (max_length - len(x))
+    #     y = y[:max_length] + [0] * (max_length - len(y))
+    #     # 创建mask
+    #     mask = create_mask1(max_length, max_length)
+    #     tensor_x = torch.LongTensor(x)
+    #     tensor_y = torch.LongTensor(y)
+    #     dataset.append([tensor_x, mask, tensor_y])
+    # return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+
+# 构造掩码，输入两个字符串的长度
+def create_mask(s1, s2):
+    len_s1 = s1 + 2  # cls + sep
+    len_s2 = s2 + 1  # sep
+    # 创建掩码张量
+    mask = torch.ones(len_s1 + len_s2, len_s1 + len_s2)
+    # 遍历s1的每个token
+    for i in range(len_s1):
+        # s1的当前token不能看到s2的任何token
+        mask[i, len_s1:] = 0
+        # 遍历s2的每个token
+    for i in range(len_s2):
+        # s2的当前token不能看到后面的s2 token
+        mask[len_s1 + i, len_s1 + i + 1:] = 0
+    return mask
+
+#
+# # 构造掩码，输入两个字符串的长度
+# def create_mask1(len_s1, len_s2):
+#     # 创建掩码张量
+#     mask = torch.ones(len_s1, len_s2)
+#     # 遍历s1的每个token
+#     for i in range(len_s1):
+#         # s1的当前token不能看到s2的任何token
+#         mask[i, len_s1:] = 0
+#         # 遍历s2的每个token
+#     for i in range(len_s2):
+#         # s2的当前token不能看到后面的s2 token
+#         mask[len_s1 + i, len_s1 + i + 1:] = 0
+#     return mask
+
+
+def pad_mask(tensor, target_shape):
+    # 获取输入张量和目标形状的长宽
+    height, width = tensor.shape
+    target_height, target_width = target_shape
+    # 创建一个全零张量,形状为目标形状
+    result = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+    # 计算需要填充或截断的区域
+    h_start = 0
+    w_start = 0
+    h_end = min(height, target_height)
+    w_end = min(width, target_width)
+    # 将原始张量对应的部分填充到全零张量中
+    result[h_start:h_end, w_start:w_end] = tensor[:h_end - h_start, :w_end - w_start]
+    result[0:50, 0:50] = tensor[:50 - 0, :50 - 0]
+    return result
+
+
+# 建立模型
+def build_model(vocab_size, char_dim):
+    model = LanguageModel(char_dim, vocab_size)
+    return model
+
+
+# 文本生成测试代码
+def generate_sentence(openings, model, tokenizer):
+    model.eval()
+    openings = tokenizer.encode(openings)
+    with torch.no_grad():
+        # 生成文本超过30字则终止迭代
+        while len(openings) <= 50:
+            x = torch.LongTensor([openings])
+            if torch.cuda.is_available():
+                x = x.cuda()
+            y = model(x)[0][-1]
+            index = sampling_strategy(y)
+            openings.append(index)
+    return tokenizer.decode(openings)
+
+
+# 采样策略
+def sampling_strategy(prob_distribution):
+    if random.random() > 0.1:
+        # 90%的概率，采用greedy
+        strategy = "greedy"
+    else:
+        # 10%的概率，采用sampling
+        strategy = "sampling"
+
+    if strategy == "greedy":
+        # 比较简单，直接获取概率值最高的
+        return int(torch.argmax(prob_distribution))
+    elif strategy == "sampling":
+        prob_distribution = prob_distribution.cpu().numpy()
+        """
+        prob_distributions：词表大小的概率分布 [第1个,...0.2,0.18,...,第3961个]
+        len(prob_distribution)：3961
+        range(3961)：range(0,3961)
+        list(0,3961)：[0,1,2,...3961]
+        np.random.choice：是从这个list集合中随机选择一个索引值，作为返回
+        p=prob_distribution：概率值相加=1(因为是过了softmax函数，概率值相加是1)，按照概率值有权重地选择元素
+        """
+        return np.random.choice(list(range(len(prob_distribution))), p=prob_distribution)
+
+
+def train(corpus_path, save_weight=True):
+    epoch_num = 20  # 训练轮数
+    batch_size = 32  # 每次训练样本个数
+    train_sample = 50000  # 每轮训练总共训练的样本总数
+    char_dim = 768  # 每个字的维度
+    vocab_size = 21128  # 字表大小，如果使用bert分词时，需要使用该大小
+    max_length = 50  # 样本文本长度
+
+    corpus = load_corpus(corpus_path)  # 加载语料
+    tokenizer = BertTokenizer.from_pretrained(r"D:\code_repository\ai-study\bert-base-chinese")
+    train_data = build_dataset(tokenizer, max_length, corpus, batch_size)  # 建立数据集
+    model = build_model(vocab_size, char_dim)  # 建立模型
+    if torch.cuda.is_available():
+        model = model.cuda()
+    optim = torch.optim.Adam(model.parameters(), lr=0.01)  # 建立优化器
+    print("文本词表模型加载完毕，开始训练")
+    for epoch in range(epoch_num):
+        model.train()
+        watch_loss = []
+        for batch in range(int(train_sample / batch_size)):
+            for x, mask, y in train_data:  # 构建一组训练样本
+                if torch.cuda.is_available():
+                    x, y = x.cuda(), y.cuda()
+                optim.zero_grad()  # 梯度归零
+                loss = model(x, y, mask)  # 计算loss
+                loss.backward()  # 计算梯度
+                optim.step()  # 更新权重
+                watch_loss.append(loss.item())
+        print("=========\n第%d轮平均loss:%f" % (epoch + 1, np.mean(watch_loss)))
+        print(generate_sentence("潜伏者涂兆兴：敌人眼皮下掩护红色后代", model, tokenizer))
+    if not save_weight:
+        return
+    else:
+        base_name = os.path.basename(corpus_path).replace("txt", "pth")
+        model_path = os.path.join("model", base_name)
+        torch.save(model.state_dict(), model_path)
+        return
+
+
+if __name__ == "__main__":
+    train("sample_data.json", False)
